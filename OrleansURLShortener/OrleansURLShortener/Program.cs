@@ -1,44 +1,91 @@
+// <Configuration>
+using Microsoft.AspNetCore.Http.Extensions;
+using Orleans.Runtime;
+
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
-// Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
+builder.Host.UseOrleans(siloBuilder =>
+{
+    siloBuilder.UseLocalhostClustering();
+    siloBuilder.AddMemoryGrainStorage("urls");
+});
 
 var app = builder.Build();
+// </Configuration
 
-// Configure the HTTP request pipeline.
-if (app.Environment.IsDevelopment())
-{
-    app.UseSwagger();
-    app.UseSwaggerUI();
-}
+// <Endpoints>
+app.MapGet("/", () => "Hello World!");
 
-app.UseHttpsRedirection();
+app.MapGet("/shorten/{*path}",
+    async (IGrainFactory grains, HttpRequest request, string path) =>
+    {
+        // Create a unique, short ID
+        var shortenedRouteSegment = Guid.NewGuid().GetHashCode().ToString("X");
 
-var summaries = new[]
-{
-    "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
-};
+        // Create and persist a grain with the shortened ID and full URL
+        var shortenerGrain = grains.GetGrain<IUrlShortenerGrain>(shortenedRouteSegment);
+        await shortenerGrain.SetUrl(path);
 
-app.MapGet("/weatherforecast", () =>
-{
-    var forecast = Enumerable.Range(1, 5).Select(index =>
-        new WeatherForecast
-        (
-            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-            Random.Shared.Next(-20, 55),
-            summaries[Random.Shared.Next(summaries.Length)]
-        ))
-        .ToArray();
-    return forecast;
-})
-.WithName("GetWeatherForecast")
-.WithOpenApi();
+        // Return the shortened URL for later use
+        var resultBuilder = new UriBuilder(request.GetEncodedUrl())
+        {
+            Path = $"/go/{shortenedRouteSegment}"
+        };
+
+        return Results.Ok(resultBuilder.Uri);
+    });
+
+app.MapGet("/go/{shortenedRouteSegment}",
+    async (IGrainFactory grains, string shortenedRouteSegment) =>
+    {
+        // Retrieve the grain using the shortened ID and redirect to the original URL        
+        var shortenerGrain = grains.GetGrain<IUrlShortenerGrain>(shortenedRouteSegment);
+        var url = await shortenerGrain.GetUrl();
+
+        return Results.Redirect(url);
+    });
 
 app.Run();
+// </Endpoint>
 
-internal record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
+// <GrainInterface>
+public interface IUrlShortenerGrain : IGrainWithStringKey
 {
-    public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
+    Task SetUrl(string fullUrl);
+    Task<string> GetUrl();
 }
+// </GrainInterface>
+
+// <Grain>
+public class UrlShortenerGrain : Grain, IUrlShortenerGrain
+{
+    private readonly IPersistentState<UrlDetails> _state;
+
+    public UrlShortenerGrain(
+        [PersistentState(
+                stateName: "url",
+                storageName: "urls")]
+                IPersistentState<UrlDetails> state)
+    {
+        _state = state;
+    }
+
+    public async Task SetUrl(string fullUrl)
+    {
+        _state.State = new UrlDetails() { ShortenedRouteSegment = this.GetPrimaryKeyString(), FullUrl = fullUrl };
+        await _state.WriteStateAsync();
+    }
+
+    public Task<string> GetUrl()
+    {
+        return Task.FromResult(_state.State.FullUrl);
+    }
+}
+
+[GenerateSerializer]
+public record UrlDetails
+{
+    public string FullUrl { get; set; }
+    public string ShortenedRouteSegment { get; set; }
+}
+// </grain>
